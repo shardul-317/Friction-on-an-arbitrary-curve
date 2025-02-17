@@ -1,0 +1,166 @@
+Web VPython 3.2
+from vpython import *
+
+# Initialize scene
+scene = canvas(width=800, height=400, range=6, forward=vec(0, -0.3, -1))
+scene.camera.pos = vec(0, 3, 10)
+scene.caption = """<b>Friction on a Curved Surface</b>
+Initial velocity: 10.0 m/s
+Friction coefficient: 0.3"""
+
+# Physics parameters
+g = 9.81  # m/s²
+mass = 1.0  # kg
+mu = 0.3  # friction coefficient
+dt = 0.01  # time step
+
+# Surface parameters
+xmin = -5
+xmax = 5
+dx = 0.1  # Segment size for energy conservation
+
+# Surface function (parabola)
+def y(x):
+    if x < -2:
+        return 0.1 * x**2  # Gentle slope
+    elif x < 2:
+        return 2 * cos(x)  # Curved section
+    else:
+        return 0.3 * x**3  # Steep slope
+
+
+# Create surface
+surface_points = []
+for x in range(int(xmin / dx), int(xmax / dx) + 1):
+    xval = x * dx
+    surface_points.append(vec(xval, y(xval), 0))
+
+surface = curve(pos=surface_points, radius=0.05, color=color.cyan)
+
+# Create ball
+ball = sphere(pos=vec(0, y(0), 0), radius=0.2, color=color.red,
+              make_trail=True, trail_type="points", interval=5)
+
+# Initial conditions
+x = -4
+v = 0.0  # Initial velocity
+W = 0  # Total work done by friction
+
+# Text displays
+vel_display = label(pos=vec(0, 5, 0), text='Velocity: 0 m/s', height=16, box=False)
+energy_display = label(pos=vec(0, 4.5, 0), text='Energy: 0 J', height=16, box=False)
+work_display = label(pos=vec(0, 4, 0), text='Work done by friction: 0 J', height=16, box=False)
+
+# Calculate derivatives numerically
+def dy_dx(x):
+    h = 0.0001
+    return (y(x + h) - y(x - h)) / (2 * h)
+
+def d2y_dx2(x):
+    h = 0.0001
+    return (y(x + h) - 2 * y(x) + y(x - h)) / (h * h)
+
+# Calculate radius of curvature
+def radius_of_curvature(x):
+    dydx = dy_dx(x)
+    d2ydx2 = d2y_dx2(x)
+    if abs(d2ydx2) < 1e-10:
+        return 1e10  # Avoid division by zero
+    return (1 + dydx * dydx) ** 1.5 / abs(d2ydx2)
+
+# Function to update velocity using energy conservation
+def update_velocity(v, y_old, y_new, W_friction):
+    KE_old = 0.5 * mass * v ** 2
+    PE_old = mass * g * y_old
+    E_old = KE_old + PE_old
+
+    # Update energy after friction
+    E_new = E_old - W_friction
+
+    # Update kinetic energy
+    PE_new = mass * g * y_new
+    KE_new = E_new - PE_new
+
+    # Update velocity
+    if KE_new < 0:
+        return 0  # Object has stopped
+    return sqrt(2 * KE_new / mass)
+
+# Buttons for control
+running = True
+
+def run(b):
+    global running
+    running = not running
+    if running:
+        b.text = "Pause"
+    else:
+        b.text = "Run"
+
+def reset(b):
+    global x, v, W, running
+    x = -4
+    v = 3.0
+    W = 0
+    ball.clear_trail()
+    ball.pos = vec(x, y(x), 0)
+    running = True
+    run_button.text = "Pause"
+    vel_display.text = f'Velocity: {v:.2f} m/s'
+    energy_display.text = f'Energy: {0.5 * mass * v ** 2 + mass * g * y(x):.2f} J'
+    work_display.text = f'Work done by friction: {W:.2f} J'
+
+# Add buttons
+run_button = button(text="Pause", bind=run)
+button(text="Reset", bind=reset)
+
+# Main simulation loop
+while True:
+    rate(100)
+    if running and x < xmax and x > xmin:
+        # Calculate slope and radius of curvature
+        theta = atan(dy_dx(x))
+        R = radius_of_curvature(x)
+
+        # Normal force components
+        N_gravity = mass * g * cos(theta)
+        N_centripetal = mass * v ** 2 / R
+        N_total = N_gravity + N_centripetal
+
+        # Check for takeoff
+        if N_total <= 0:
+            vel_display.text = "Object lost contact with surface!"
+            running = False
+            continue
+
+        # Friction force
+        friction = mu * N_total
+
+        # Work done by friction in this segment
+        ds = sqrt(1 + dy_dx(x) ** 2) * dx
+        dW = friction * ds
+        W += dW
+
+        # Update velocity using energy conservation
+        y_old = y(x)
+        x += dx
+        y_new = y(x)
+        v = update_velocity(v, y_old, y_new, dW)
+
+        # Stop simulation if velocity is too small
+        if v < 0.01:
+            vel_display.text = "Object stopped due to friction"
+            running = False
+            continue
+
+        # Update ball position
+        ball.pos = vec(x, y_new, 0)
+
+        # Update displays
+        KE = 0.5 * mass * v ** 2
+        PE = mass * g * y_new
+        total_E = KE + PE
+
+        vel_display.text = f'Velocity: {v:.2f} m/s'
+        energy_display.text = f'Energy: {total_E:.2f} J'
+        work_display.text = f'Work done by friction: {W:.2f} J'
