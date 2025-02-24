@@ -1,0 +1,318 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import sympy as sp
+from numba import njit
+
+# ====================== SETTINGS ======================
+plt.style.use('default')
+plt.rcParams.update({
+    'font.size': 12,
+    'axes.titlesize': 14,
+    'axes.labelsize': 12,
+    'grid.color': '#AAAAAA',
+    'grid.linestyle': '--',
+    'grid.linewidth': 0.5,
+    'figure.figsize': (14, 12)
+})
+
+# ================ PHYSICS CONSTANTS ===================
+g = 9.81  # m/s²
+
+# ================ USER CONFIGURATION ==================
+SURFACE_TYPE = 'ellipse'  # Options: 'circle', 'ellipse', 'function'
+SURFACE_PARAMS = {
+    'circle': {'radius': 5.0},
+    'ellipse': {'a': 5.0, 'b': 3.0},
+    'function': {'eq': "0.1*sin(2*x)"}
+}
+PARAMS = {
+    'mass': 1.0,
+    'mu': lambda x: 0.2 + 0.05 * np.sin(x / 2),
+    'v0': 4.0,
+    'x_range': (0, 15),
+    'dx': 0.001
+}
+# ======================================================
+
+@njit
+def safe_sqrt(x):
+    """Numba-compatible safe square root with value clamping"""
+    return np.sqrt(np.maximum(x, 1e-12))
+
+def create_surface_functions(surface_type, params):
+    """Create surface geometry with numerical safeguards"""
+    if surface_type == 'circle':
+        r = params['radius']
+        return (
+            lambda x: safe_sqrt(r**2 - x**2),
+            lambda x: -x / (safe_sqrt(r**2 - x**2) + 1e-12),
+            lambda x: -r**2 / (safe_sqrt((r**2 - x**2)**3) + 1e-12)
+        )
+    elif surface_type == 'ellipse':
+        a, b = params['a'], params['b']
+        return (
+            lambda x: b * safe_sqrt(1 - (x / a)**2),
+            lambda x: -(b**2 / a**2) * x / (safe_sqrt(1 - (x / a)**2) + 1e-12),
+            lambda x: -(b**2 / a**2) / (safe_sqrt((1 - (x / a)**2)**3) + 1e-12)
+        )
+    else:
+        x_sym = sp.symbols('x')
+        y_sym = sp.sympify(params['eq'])
+        return (
+            sp.lambdify(x_sym, y_sym, 'numpy'),
+            sp.lambdify(x_sym, y_sym.diff(x_sym), 'numpy'),
+            sp.lambdify(x_sym, y_sym.diff(x_sym, 2), 'numpy')
+        )
+
+@njit
+def simulate_core(x, y, dydx, curvature, mass, mu_array, v0, dx):
+    """JIT-optimized physics engine with proper energy conservation"""
+    n = len(x)
+    v = np.full(n, np.nan)
+    E_mech = np.full(n, np.nan)
+    W_fric = np.zeros(n)
+    contact = np.ones(n, dtype=np.bool_)
+    projectile = np.zeros(n, dtype=np.bool_)
+    N_total_array = np.full(n, np.nan)  # Initialize total normal force array
+    N_grav_array = np.full(n, np.nan)  # Initialize gravitational normal force array
+    N_cent_array = np.full(n, np.nan)  # Initialize centripetal normal force array
+    a = np.full(n, np.nan)  # Initialize acceleration array
+
+    # Initial conditions
+    v[0] = v0
+    E_mech[0] = 0.5 * mass * v0**2 + mass * g * y[0]
+    W_fric[0] = 0.0
+    liftoff_idx = -1
+
+    for i in range(1, n):
+        if projectile[i-1]:
+            # Projectile motion phase
+            dt = dx / (v[i-1] + 1e-6)  # Prevent division by zero
+            theta = np.arctan(dydx[liftoff_idx-1])
+            vx = v[liftoff_idx-1] * np.cos(theta)
+            vy = v[liftoff_idx-1] * np.sin(theta) - g * dt
+            v[i] = np.sqrt(vx**2 + vy**2)
+            y[i] = y[liftoff_idx-1] + vy * dt - 0.5 * g * dt**2
+            E_mech[i] = E_mech[liftoff_idx-1]
+            W_fric[i] = W_fric[liftoff_idx-1]
+            projectile[i] = True
+            N_total_array[i-1] = 0.0  # Normal force is zero during projectile
+            N_grav_array[i-1] = 0.0
+            N_cent_array[i-1] = 0.0
+            a[i] = -g  # Free fall acceleration
+            continue
+
+        if np.isnan(v[i-1]) or v[i-1] <= 0:
+            break
+
+        # Current surface properties
+        slope = dydx[i-1]
+        theta = np.arctan(slope)
+        ds = np.sqrt(1 + slope**2) * dx
+        dy = y[i] - y[i-1]  # Correct height difference
+
+        # Normal force calculation
+        R = curvature[i-1]
+        N_grav = mass * g * np.cos(theta)
+        N_cent = mass * v[i-1]**2 / R if not np.isinf(R) else 0.0
+        N_total = N_grav + N_cent
+
+        # Liftoff detection and normal force storage
+        if N_total <= 0:
+            N_total_array[i-1] = 0.0  # Set to zero at liftoff
+            N_grav_array[i-1] = 0.0
+            N_cent_array[i-1] = 0.0
+            liftoff_idx = i
+            projectile[i:] = True
+            W_fric[i:] = W_fric[i-1]
+            E_mech[i:] = E_mech[i-1]
+            a[i:] = -g  # Free fall acceleration
+            continue
+        else:
+            N_total_array[i-1] = N_total  # Store total normal force
+            N_grav_array[i-1] = N_grav
+            N_cent_array[i-1] = N_cent
+
+        # Friction work calculation
+        mu = mu_array[i-1]
+        dW = mu * N_total * ds
+        W_fric[i] = W_fric[i-1] + dW
+
+        # Velocity update formula
+        v_sq = v[i-1]**2 - 2 * g * dy - 2 * dW / mass
+        v[i] = safe_sqrt(v_sq)
+
+        # Acceleration calculation
+        a[i] = -g * np.sin(theta) - (mu * N_total / mass) * v[i-1] / np.sqrt(1 + slope**2)
+
+        # Energy conservation update
+        E_mech[i] = E_mech[i-1] - dW
+
+    return v, E_mech, W_fric, contact, projectile, N_total_array, N_grav_array, N_cent_array, a
+
+class SurfaceSystem:
+    def __init__(self):
+        self.y_func, self.dy_dx, self.d2y_dx2 = create_surface_functions(
+            SURFACE_TYPE, SURFACE_PARAMS[SURFACE_TYPE])
+        self._precompute_geometry()
+
+    def _precompute_geometry(self):
+        """Precalculate surface properties with domain constraints"""
+        self.x = np.arange(PARAMS['x_range'][0], PARAMS['x_range'][1], PARAMS['dx'])
+        self.y = self.y_func(self.x)
+        self.dydx = self.dy_dx(self.x)
+        self.d2ydx2 = self.d2y_dx2(self.x)
+
+        # Curvature calculation with numerical safeguards
+        with np.errstate(divide='ignore', invalid='ignore'):
+            self.curvature = (1 + self.dydx**2)**1.5 / np.abs(self.d2ydx2)
+            self.curvature = np.where(np.abs(self.d2ydx2) < 1e-6, np.inf, self.curvature)
+
+        # Handle friction coefficient
+        if callable(PARAMS['mu']):
+            self.mu_array = PARAMS['mu'](self.x)
+        else:
+            self.mu_array = np.full_like(self.x, PARAMS['mu'])
+
+    def run(self):
+        """Execute simulation with comprehensive output"""
+        results = {}
+        v, E_mech, W_fric, contact, projectile, N_total, N_grav, N_cent, a = simulate_core(
+            self.x, self.y, self.dydx, self.curvature,
+            PARAMS['mass'], self.mu_array, PARAMS['v0'], PARAMS['dx'])
+
+        valid = ~np.isnan(v)
+        results['x'] = self.x[valid]
+        results['v'] = v[valid]
+        results['y_surface'] = self.y[valid]
+        results['E_mech'] = E_mech[valid]
+        results['W_fric'] = W_fric[valid]
+        results['contact'] = contact[valid]
+        results['projectile'] = projectile[valid]
+        results['liftoff'] = self._find_liftoff_point(projectile)
+        results['N_total'] = N_total[valid]  # Include total normal force in results
+        results['N_grav'] = N_grav[valid]  # Include gravitational normal force in results
+        results['N_cent'] = N_cent[valid]  # Include centripetal normal force in results
+        results['a'] = a[valid]  # Include acceleration in results
+
+        # Energy components
+        results['KE'] = 0.5 * PARAMS['mass'] * results['v']**2
+        results['PE'] = PARAMS['mass'] * g * results['y_surface']
+        results['Total_Energy'] = results['KE'] + results['PE'] + results['W_fric']
+        results['Energy_Error'] = results['Total_Energy'] - results['E_mech'][0]
+
+        return results
+
+    def _find_liftoff_point(self, projectile):
+        """Accurate liftoff detection"""
+        if np.any(projectile):
+            return self.x[np.argmax(projectile)]
+        return None
+
+def visualize(results):
+    """Professional six-panel visualization with normal force components and acceleration"""
+    fig = plt.figure(figsize=(14, 14))
+    gs = fig.add_gridspec(6, 1, height_ratios=[2, 1, 2, 2, 2, 2])  # Added a sixth row
+
+    # Custom color scheme
+    colors = {
+        'KE': '#FF7F0E',    # Orange
+        'PE': '#2CA02C',    # Green
+        'Work': '#D62728',  # Red
+        'Total': '#1F77B4', # Blue
+        'Error': '#7F7F7F', # Gray
+        'Path': '#D62728',
+        'Surface': '#FF9999',
+        'Normal': '#9467BD',  # New color for total normal force
+        'Grav': '#8C564B',  # New color for gravitational normal force
+        'Cent': '#E377C2',   # New color for centripetal normal force
+        'Acceleration': '#17BECF'  # New color for acceleration
+    }
+
+    # Energy plot
+    ax0 = fig.add_subplot(gs[0])
+    ax0.plot(results['x'], results['KE'], color=colors['KE'], label='Kinetic Energy')
+    ax0.plot(results['x'], results['PE'], color=colors['PE'], label='Potential Energy')
+    ax0.plot(results['x'], results['W_fric'], color=colors['Work'], label='Friction Work')
+    ax0.plot(results['x'], results['Total_Energy'], '--', color=colors['Total'], label='Total Energy')
+    ax0.plot(results['x'], results['Energy_Error'], ':', color=colors['Error'], label='Conservation Error')
+    ax0.set_title('Energy Components Analysis', fontweight='bold')
+    ax0.legend(ncol=3, loc='upper right')
+    ax0.grid(True, alpha=0.3)
+
+    # Velocity plot
+    ax1 = fig.add_subplot(gs[1])
+    ax1.plot(results['x'], results['v'], color=colors['Total'])
+    ax1.set_title('Velocity Profile', fontweight='bold')
+    ax1.set_ylabel('Velocity (m/s)')
+    ax1.grid(True, alpha=0.3)
+
+    # Surface plot
+    ax2 = fig.add_subplot(gs[2])
+    full_x = np.linspace(*PARAMS['x_range'], 1000)
+    full_y = SurfaceSystem().y_func(full_x)
+
+    ax2.plot(full_x, full_y, color=colors['Surface'], alpha=0.3, label='Full Surface')
+    ax2.plot(results['x'], results['y_surface'], color=colors['Path'], linewidth=2, label='Object Path')
+
+    # Start/end markers
+    ax2.scatter(PARAMS['x_range'][0], full_y[0], color='#444444', s=100,
+               marker='s', edgecolor='black', label='Start')
+    ax2.scatter(results['x'][-1], results['y_surface'][-1], color='#FF7F0E', s=100,
+               marker='o', edgecolor='black', label='End')
+
+    # Liftoff annotation
+    if results['liftoff'] is not None:
+        lidx = np.argmin(np.abs(results['x'] - results['liftoff']))
+        ax2.scatter(results['liftoff'], results['y_surface'][lidx], color='#9467BD', s=150,
+                  marker='*', edgecolor='black', label='Liftoff')
+        ax2.axvline(results['liftoff'], color='#9467BD', linestyle=':', alpha=0.5)
+
+    ax2.set_title('Surface Analysis', fontweight='bold')
+    ax2.legend(ncol=4, loc='upper right')
+    ax2.set_xlim(PARAMS['x_range'])
+    ax2.grid(True, alpha=0.3)
+
+    # Normal Force plot
+    ax3 = fig.add_subplot(gs[3])
+    ax3.plot(results['x'], results['N_total'], color=colors['Normal'], label='Total Normal Force')
+    ax3.plot(results['x'], results['N_grav'], color=colors['Grav'], linestyle=':', label='Gravitational Normal Force')
+    ax3.plot(results['x'], results['N_cent'], color=colors['Cent'], linestyle=':', label='Centripetal Normal Force')
+    ax3.set_title('Normal Force Components', fontweight='bold')
+    ax3.set_xlabel('x (m)')
+    ax3.set_ylabel('Normal Force (N)')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+
+    # Acceleration plot
+    ax4 = fig.add_subplot(gs[4])
+    ax4.plot(results['x'], results['a'], color=colors['Acceleration'], label='Acceleration')
+    ax4.set_title('Acceleration Profile', fontweight='bold')
+    ax4.set_xlabel('x (m)')
+    ax4.set_ylabel('Acceleration (m/s²)')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# Main execution
+if __name__ == "__main__":
+    system = SurfaceSystem()
+    results = system.run()
+
+    print("=== Simulation Results ===")
+    print("Surface type: {}".format(SURFACE_TYPE))
+    print("Initial total energy: {:.2f} J".format(results['E_mech'][0]))
+    print("Final total energy: {:.2f} J".format(results['E_mech'][-1]))
+    print("Total friction work: {:.2f} J".format(results['W_fric'][-1]))
+    print("Max energy error: {:.2e} J".format(np.max(np.abs(results['Energy_Error']))))
+
+    if results['liftoff']:
+        print("\nLiftoff occurred at x = {:.2f} m".format(results['liftoff']))
+        post_liftoff_work = results['W_fric'][-1] - results['W_fric'][results['x'] <= results['liftoff']][-1]
+        print("Friction work after liftoff: {:.2e} J".format(post_liftoff_work))
+    else:
+        print("\nFull contact maintained throughout motion")
+
+    visualize(results)
